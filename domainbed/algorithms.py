@@ -57,6 +57,8 @@ ALGORITHMS = [
     'RDM',
     'ADRMX',
     'URM',
+    'CAVREx',
+    'CAIRM',
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -787,6 +789,174 @@ class VREx(ERM):
         return {'loss': loss.item(), 'nll': nll.item(),
                 'penalty': penalty.item()}
 
+class CAVREx(ERM):
+    """
+    Complexity-Aware VREx
+    用跨 domain 的 feature mean 距离作为 complexity proxy,
+    再自适应放大 VREx penalty。
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CAVREx, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.register_buffer('complexity_ema', torch.tensor([0.0]))
+
+    def _domain_complexity(self, features_per_domain):
+        if len(features_per_domain) <= 1:
+            return torch.tensor(0.0, device=features_per_domain[0].device)
+
+        means = [feat.mean(dim=0) for feat in features_per_domain]
+        total = 0.0
+        count = 0
+        for i in range(len(means)):
+            for j in range(i + 1, len(means)):
+                total = total + (means[i] - means[j]).pow(2).mean()
+                count += 1
+        return total / max(count, 1)
+
+    def update(self, minibatches, unlabeled=None):
+        if self.update_count >= self.hparams["vrex_penalty_anneal_iters"]:
+            penalty_weight = self.hparams["vrex_lambda"]
+        else:
+            penalty_weight = 1.0
+
+        features_per_domain = []
+        losses = []
+
+        for x, y in minibatches:
+            feats = self.featurizer(x)
+            logits = self.classifier(feats)
+            loss_i = F.cross_entropy(logits, y)
+
+            features_per_domain.append(feats)
+            losses.append(loss_i)
+
+        losses = torch.stack(losses)
+        mean = losses.mean()
+        penalty = ((losses - mean) ** 2).mean()
+
+        raw_complexity = self._domain_complexity(features_per_domain)
+
+        with torch.no_grad():
+            self.complexity_ema.mul_(self.hparams["ca_ema"]).add_(
+                (1.0 - self.hparams["ca_ema"]) * raw_complexity.detach()
+            )
+
+        used_complexity = torch.clamp(
+            self.complexity_ema.detach(), 0.0, self.hparams["ca_lambda_clip"]
+        )
+        adaptive_multiplier = 1.0 + self.hparams["ca_lambda_scale"] * used_complexity
+
+        loss = mean + penalty_weight * adaptive_multiplier * penalty
+
+        if self.update_count == self.hparams['vrex_penalty_anneal_iters']:
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay']
+            )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+        return {
+            'loss': loss.item(),
+            'nll': mean.item(),
+            'penalty': penalty.item(),
+            'complexity': raw_complexity.item(),
+            'ca_lambda': (penalty_weight * adaptive_multiplier).item()
+        }
+
+
+class CAIRM(ERM):
+    """
+    Complexity-Aware IRM
+    用跨 domain 的 feature mean 距离作为 complexity proxy,
+    再自适应放大 IRM penalty。
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CAIRM, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.register_buffer('complexity_ema', torch.tensor([0.0]))
+
+    @staticmethod
+    def _irm_penalty(logits, y):
+        device = "cuda" if logits[0][0].is_cuda else "cpu"
+        scale = torch.tensor(1.).to(device).requires_grad_()
+        loss_1 = F.cross_entropy(logits[::2] * scale, y[::2])
+        loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2])
+        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+        return torch.sum(grad_1 * grad_2)
+
+    def _domain_complexity(self, features_per_domain):
+        if len(features_per_domain) <= 1:
+            return torch.tensor(0.0, device=features_per_domain[0].device)
+
+        means = [feat.mean(dim=0) for feat in features_per_domain]
+        total = 0.0
+        count = 0
+        for i in range(len(means)):
+            for j in range(i + 1, len(means)):
+                total = total + (means[i] - means[j]).pow(2).mean()
+                count += 1
+        return total / max(count, 1)
+
+    def update(self, minibatches, unlabeled=None):
+        if self.update_count >= self.hparams['irm_penalty_anneal_iters']:
+            penalty_weight = self.hparams['irm_lambda']
+        else:
+            penalty_weight = 1.0
+
+        nll = 0.0
+        penalty = 0.0
+        features_per_domain = []
+
+        for x, y in minibatches:
+            feats = self.featurizer(x)
+            logits = self.classifier(feats)
+
+            features_per_domain.append(feats)
+            nll = nll + F.cross_entropy(logits, y)
+            penalty = penalty + self._irm_penalty(logits, y)
+
+        nll = nll / len(minibatches)
+        penalty = penalty / len(minibatches)
+
+        raw_complexity = self._domain_complexity(features_per_domain)
+
+        with torch.no_grad():
+            self.complexity_ema.mul_(self.hparams["ca_ema"]).add_(
+                (1.0 - self.hparams["ca_ema"]) * raw_complexity.detach()
+            )
+
+        used_complexity = torch.clamp(
+            self.complexity_ema.detach(), 0.0, self.hparams["ca_lambda_clip"]
+        )
+        adaptive_multiplier = 1.0 + self.hparams["ca_lambda_scale"] * used_complexity
+
+        loss = nll + penalty_weight * adaptive_multiplier * penalty
+
+        if self.update_count == self.hparams['irm_penalty_anneal_iters']:
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay']
+            )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+        return {
+            'loss': loss.item(),
+            'nll': nll.item(),
+            'penalty': penalty.item(),
+            'complexity': raw_complexity.item(),
+            'ca_lambda': (penalty_weight * adaptive_multiplier).item()
+        }
 
 class Mixup(ERM):
     """
