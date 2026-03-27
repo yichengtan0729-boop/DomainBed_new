@@ -107,12 +107,12 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm == "MTL":
         _hparam('mtl_ema', .99, lambda r: r.choice([0.5, 0.9, 0.99, 1.]))
 
-    if algorithm in ["VREx", "CAVREx"]:
+    elif algorithm in ["VREx", "CAVREx"]:
         _hparam('vrex_lambda', 1e1, lambda r: 10**r.uniform(-1, 5))
         _hparam('vrex_penalty_anneal_iters', 500,
                 lambda r: int(10**r.uniform(0, 4)))
     
-    elif algorithm in ["CAIRM", "CAVREx"]:
+    if algorithm in ["CAIRM", "CAVREx"]:
         _hparam('ca_lambda_scale', 1.0, lambda r: r.choice([0.1, 0.3, 0.5, 1.0, 2.0]))
         _hparam('ca_lambda_clip', 5.0, lambda r: r.choice([1.0, 2.0, 5.0, 10.0]))
         _hparam('ca_ema', 0.9, lambda r: r.choice([0.0, 0.5, 0.9, 0.95]))
